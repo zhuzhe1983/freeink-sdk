@@ -8,7 +8,11 @@ constexpr int I2S_NUM_0 = 0, I2S_ROLE_SLAVE = 1, I2S_GPIO_UNUSED = -1;
 constexpr int I2S_DATA_BIT_WIDTH_32BIT = 32, I2S_SLOT_MODE_STEREO = 2;
 struct FakeChannel { bool initialized = false, enabled = false, deleted = true; };
 using i2s_chan_handle_t = FakeChannel*;
-struct i2s_chan_config_t { int id, role; bool auto_clear = false; };
+struct i2s_chan_config_t {
+  int id, role;
+  bool auto_clear = false;
+  uint32_t dma_desc_num = 6, dma_frame_num = 240;
+};
 struct i2s_std_config_t {
   struct { uint32_t sample_rate_hz; int mclk_multiple = 256; } clk_cfg;
   struct { int width, mode; } slot_cfg;

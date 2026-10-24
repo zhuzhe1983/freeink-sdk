@@ -17,6 +17,13 @@ namespace {
 
 constexpr uint32_t CODEC_I2C_HZ = 100000;  // OEM bus speed (shared with touch)
 constexpr size_t READ_CHUNK = 1024;        // mono source bytes per loop pass
+constexpr size_t STREAM_CHUNK_FRAMES = 64;
+constexpr uint32_t STREAM_RATE = 24000;
+constexpr uint32_t STREAM_DMA_DESCRIPTORS = 4;
+constexpr uint32_t STREAM_DMA_FRAMES = 120;  // 4 * 120 / 24000 = 20 ms
+constexpr uint32_t STREAM_WRITE_BUDGET_MS = 100;
+constexpr uint32_t STREAM_DRAIN_BUDGET_MS = 40;
+constexpr uint32_t STREAM_WRITE_SLICE_MS = 20;
 
 // ES8388 playback init recovered from the Murphy OEM firmware — exact register
 // order matters (staged mute -> clocks/format -> mixers -> power -> unmute).
@@ -24,10 +31,9 @@ struct RegVal {
   uint8_t reg, val;
 };
 constexpr RegVal ES8388_INIT[] = {
-    {0x19, 0x04}, {0x01, 0x50}, {0x02, 0x00}, {0x08, 0x00}, {0x04, 0x3e}, {0x00, 0x12},
-    {0x17, 0x18}, {0x18, 0x02}, {0x26, 0x1b}, {0x27, 0x90}, {0x2a, 0x90}, {0x2b, 0x80},
-    {0x2d, 0x00}, {0x1b, 0x00}, {0x1a, 0x00}, {0x03, 0xff}, {0x09, 0x88}, {0x0a, 0xf0},
-    {0x0b, 0x80}, {0x0c, 0x0e}, {0x0d, 0x02}, {0x10, 0x20}, {0x11, 0x20}, {0x2e, 0x1e},
+    {0x19, 0x04}, {0x01, 0x50}, {0x02, 0x00}, {0x08, 0x00}, {0x04, 0x3e}, {0x00, 0x12}, {0x17, 0x18}, {0x18, 0x02},
+    {0x26, 0x1b}, {0x27, 0x90}, {0x2a, 0x90}, {0x2b, 0x80}, {0x2d, 0x00}, {0x1b, 0x00}, {0x1a, 0x00}, {0x03, 0xff},
+    {0x09, 0x88}, {0x0a, 0xf0}, {0x0b, 0x80}, {0x0c, 0x0e}, {0x0d, 0x02}, {0x10, 0x20}, {0x11, 0x20}, {0x2e, 0x1e},
     {0x2f, 0x1e}, {0x30, 0x1e}, {0x31, 0x1e}, {0x04, 0x3c}, {0x19, 0x00},
 };
 
@@ -46,17 +52,16 @@ constexpr RegVal ES8311_INIT[] = {
     {0x0D, 0x01},  // SYSTEM: power up analog circuitry
     {0x12, 0x00},  // SYSTEM: power up DAC
     {0x13, 0x10},  // SYSTEM: enable output to HP drive
-    {0x32, 0xCF},  // DAC volume +16 dB (M5's default for the 1W speaker)
+    {0x32, 0xCF},  // DAC volume +8 dB (M5's default for the 1W speaker)
     {0x37, 0x08},  // DAC: bypass equalizer
 };
 
-constexpr RegVal ES8311_MCLK_16K_INIT[] = {
-    {0x00, 0x80}, {0x01, 0x3F}, {0x02, 0x00}, {0x03, 0x10}, {0x04, 0x20},
-    {0x05, 0x00}, {0x06, 0x03}, {0x07, 0x00}, {0x08, 0xFF}, {0x09, 0x0C},
-    {0x0D, 0x01}, {0x12, 0x00}, {0x13, 0x10}, {0x32, 0xCF}, {0x37, 0x08},
+constexpr RegVal ES8311_MCLK_INIT[] = {
+    {0x00, 0x80}, {0x01, 0x3F}, {0x02, 0x00}, {0x03, 0x10}, {0x04, 0x20}, {0x05, 0x00}, {0x06, 0x03}, {0x07, 0x00},
+    {0x08, 0xFF}, {0x09, 0x0C}, {0x0D, 0x01}, {0x12, 0x00}, {0x13, 0x10}, {0x32, 0xCF}, {0x37, 0x08},
 };
 
-constexpr uint8_t ES8311_VOL_MAX_REG = 0xCF;  // +16 dB, 0.5 dB/step (0xBF = 0 dB)
+constexpr uint8_t ES8311_VOL_MAX_REG = 0xCF;  // +8 dB, 0.5 dB/step (0xBF = 0 dB)
 
 uint32_t readLE32(const uint8_t* p) {
   return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
@@ -64,8 +69,7 @@ uint32_t readLE32(const uint8_t* p) {
 uint16_t readLE16(const uint8_t* p) { return (uint16_t)p[0] | ((uint16_t)p[1] << 8); }
 
 bool isEs8311(BoardConfig::AudioOutput output) {
-  return output == BoardConfig::AudioOutput::I2sEs8311 ||
-         output == BoardConfig::AudioOutput::I2sEs8311Mclk16k;
+  return output == BoardConfig::AudioOutput::I2sEs8311 || output == BoardConfig::AudioOutput::I2sEs8311Mclk16k;
 }
 
 }  // namespace
@@ -91,8 +95,8 @@ bool AudioManager::codecInit() {
   const RegVal* seq;
   size_t seqLen;
   if (cfg.output == BoardConfig::AudioOutput::I2sEs8311Mclk16k) {
-    seq = ES8311_MCLK_16K_INIT;
-    seqLen = sizeof(ES8311_MCLK_16K_INIT) / sizeof(ES8311_MCLK_16K_INIT[0]);
+    seq = ES8311_MCLK_INIT;
+    seqLen = sizeof(ES8311_MCLK_INIT) / sizeof(ES8311_MCLK_INIT[0]);
   } else if (cfg.output == BoardConfig::AudioOutput::I2sEs8311) {
     seq = ES8311_INIT;
     seqLen = sizeof(ES8311_INIT) / sizeof(ES8311_INIT[0]);
@@ -142,6 +146,7 @@ bool AudioManager::begin() {
 
   if (!codecInit()) {
     log_e("audio codec init failed");
+    shutdownCodec();  // best-effort suspend after a partially applied sequence
     rollbackBegin();
     return false;
   }
@@ -155,7 +160,7 @@ void AudioManager::setVolume(uint8_t percent) {
   if (cfg.codecAddr == 0) return;
   if (isEs8311(cfg.output)) {
     // Single DAC volume register, 0.5 dB/step; full scale matches the init
-    // value M5 ships for this speaker (+16 dB).
+    // value M5 ships for this speaker (+8 dB).
     codecWrite(0x32, (uint8_t)((uint16_t)percent * ES8311_VOL_MAX_REG / 100));
     return;
   }
@@ -168,14 +173,13 @@ void AudioManager::setVolume(uint8_t percent) {
 }
 
 // DAC mute between alarms so nothing residual reaches the output.
-void AudioManager::codecMute(bool mute) {
+bool AudioManager::codecMute(bool mute) {
   const auto& cfg = BoardConfig::ACTIVE.audio;
-  if (cfg.codecAddr == 0) return;
+  if (cfg.codecAddr == 0) return true;
   if (isEs8311(cfg.output)) {
-    codecWrite(0x31, mute ? 0x60 : 0x00);  // DAC_MUTE bits
-  } else {
-    codecWrite(0x19, mute ? 0x04 : 0x00);  // ES8388 DACCONTROL3 soft mute
+    return codecWrite(0x31, mute ? 0x60 : 0x00);  // DAC_MUTE bits
   }
+  return codecWrite(0x19, mute ? 0x04 : 0x00);  // ES8388 DACCONTROL3 soft mute
 }
 
 void AudioManager::setAmp(bool on) {
@@ -194,15 +198,28 @@ void AudioManager::rollbackBegin() {
 }
 
 void AudioManager::powerDown() {
-  const auto& cfg = BoardConfig::ACTIVE.audio;
   if (!begun_) return;
   stop();
+  // A blocking source callback can outlive stop's bounded wait. Its task still
+  // owns the channel; never delete/reconfigure that channel underneath it.
+  if (!begun_ || isPlaying()) return;
+  shutdownCodec();
   teardownI2s();
+}
+
+void AudioManager::shutdownCodec() {
+  const auto& cfg = BoardConfig::ACTIVE.audio;
   if (isEs8311(cfg.output)) {
     // Like M5Unified's disable path: drop the amp and the codec rail.
     setAmp(false);
     if (cfg.enable != BoardConfig::PIN_UNASSIGNED) {
       digitalWrite(cfg.enable, cfg.enableActiveHigh ? LOW : HIGH);
+    } else if (cfg.output == BoardConfig::AudioOutput::I2sEs8311Mclk16k) {
+      // Wave's codec rail is shared and has no local GPIO gate. Suspend the
+      // DAC/analog path and its clocks without cutting unrelated peripherals.
+      codecWrite(0x12, 0x02);
+      codecWrite(0x0D, 0xFA);
+      codecWrite(0x01, 0x00);
     }
   } else if (cfg.codecAddr != 0) {
     codecWrite(0x02, 0xff);  // ES8388 CHIPPOWER: everything off
@@ -241,15 +258,14 @@ bool AudioManager::parseWavHeader(const WavSource& source, WavInfo& info) {
     pos += size + (size & 1);  // chunks are word-aligned
   }
 
-  return haveFmt && info.dataStart != 0 && info.bitsPerSample == 16 &&
-         (info.channels == 1 || info.channels == 2) && info.sampleRate >= 8000 &&
-         info.sampleRate <= 48000;
+  return haveFmt && info.dataStart != 0 && info.bitsPerSample == 16 && (info.channels == 1 || info.channels == 2) &&
+         info.sampleRate >= 8000 && info.sampleRate <= 48000;
 }
 
-bool AudioManager::ensureI2s(uint32_t sampleRate) {
+bool AudioManager::ensureI2s(uint32_t sampleRate, bool stream) {
   const auto& cfg = BoardConfig::ACTIVE.audio;
-  if (cfg.output == BoardConfig::AudioOutput::I2sEs8311Mclk16k && sampleRate != 16000) {
-    log_e("external-mclk ES8311 supports 16 kHz PCM only");
+  if (cfg.output == BoardConfig::AudioOutput::I2sEs8311Mclk16k && sampleRate != 16000 && sampleRate != 24000) {
+    log_e("external-mclk ES8311 supports 16/24 kHz PCM only");
     return false;
   }
   i2s_chan_handle_t tx = (i2s_chan_handle_t)txChan_;
@@ -260,7 +276,7 @@ bool AudioManager::ensureI2s(uint32_t sampleRate) {
       if (i2s_channel_enable(tx) != ESP_OK) return false;
       chanEnabled_ = true;
     }
-    return true;
+    return configureCodecRate(sampleRate);
   }
 
   if (tx) {
@@ -272,21 +288,24 @@ bool AudioManager::ensureI2s(uint32_t sampleRate) {
     if (i2s_channel_enable(tx) != ESP_OK) return false;
     chanEnabled_ = true;
     currentRate_ = sampleRate;
-    return true;
+    return configureCodecRate(sampleRate);
   }
 
   i2s_chan_config_t chanCfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
   // Without auto_clear the DMA replays its last buffers on underrun — heard
   // as a looping stutter after playback stops.
   chanCfg.auto_clear = true;
+  if (stream) {
+    chanCfg.dma_desc_num = STREAM_DMA_DESCRIPTORS;
+    chanCfg.dma_frame_num = STREAM_DMA_FRAMES;
+  }
   if (i2s_new_channel(&chanCfg, &tx, nullptr) != ESP_OK) return false;
 
   i2s_std_config_t std = {};
   std.clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(sampleRate);
   std.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
   std.slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO);
-  std.gpio_cfg.mclk = cfg.mclk == BoardConfig::PIN_UNASSIGNED ? I2S_GPIO_UNUSED
-                                                              : (gpio_num_t)cfg.mclk;
+  std.gpio_cfg.mclk = cfg.mclk == BoardConfig::PIN_UNASSIGNED ? I2S_GPIO_UNUSED : (gpio_num_t)cfg.mclk;
   std.gpio_cfg.bclk = (gpio_num_t)cfg.bclk;
   std.gpio_cfg.ws = (gpio_num_t)cfg.lrclk;
   std.gpio_cfg.dout = (gpio_num_t)cfg.dout;
@@ -303,6 +322,19 @@ bool AudioManager::ensureI2s(uint32_t sampleRate) {
   txChan_ = tx;
   chanEnabled_ = true;
   currentRate_ = sampleRate;
+  return configureCodecRate(sampleRate);
+}
+
+bool AudioManager::configureCodecRate(uint32_t sampleRate) {
+  if (begun_ && BoardConfig::ACTIVE.audio.output == BoardConfig::AudioOutput::I2sEs8311Mclk16k) {
+    // Espressif's 256-fs coefficients use DAC OSR 32 at 16 kHz, 16 at 24 kHz.
+    // Write only once clocks are running. Other clock divisors are identical.
+    // See docs/waveshare-audio-stream.md for the pinned source and coefficients.
+    if (!codecWrite(0x04, sampleRate == 16000 ? 0x20 : 0x10)) {
+      teardownI2s();
+      return false;
+    }
+  }
   return true;
 }
 
@@ -317,8 +349,11 @@ void AudioManager::teardownI2s() {
 }
 
 bool AudioManager::play(const WavSource& source, bool loop) {
+  const PlaybackState state = playbackState_.load(std::memory_order_acquire);
+  if (state == PlaybackState::PcmStream || state == PlaybackState::PcmStreamFailed) return false;
   if (!begun_ && !begin()) return false;
   stop();
+  if (isPlaying()) return false;
 
   WavInfo info;
   if (!parseWavHeader(source, info)) {
@@ -339,8 +374,11 @@ bool AudioManager::playPcm(const PcmSource& source, uint32_t sampleRate, uint8_t
     log_e("unsupported PCM (need 16-bit LE, 1-2ch, 8-48 kHz)");
     return false;
   }
+  const PlaybackState state = playbackState_.load(std::memory_order_acquire);
+  if (state == PlaybackState::PcmStream || state == PlaybackState::PcmStreamFailed) return false;
   if (!begun_ && !begin()) return false;
   stop();
+  if (isPlaying()) return false;
   if (source.seek && !source.seek(0)) {
     log_e("PCM source seek failed");
     return false;
@@ -361,6 +399,119 @@ bool AudioManager::playPcm(const PcmSource& source, uint32_t sampleRate, uint8_t
   return startPlayback(wavSource, info, false);
 }
 
+bool AudioManager::beginPcmStream(uint32_t sampleRate) {
+  if (sampleRate != STREAM_RATE || isPlaying()) return false;
+  if (!begun_ && !begin()) return false;
+  setAmp(false);
+  if (!codecMute(true)) {
+    powerDown();
+    return false;
+  }
+  // Recreate idle DMA with a bounded 20 ms queue; async cue geometry stays as-is.
+  teardownI2s();
+  if (!ensureI2s(sampleRate, true)) {
+    powerDown();
+    return false;
+  }
+  if (isEs8311(BoardConfig::ACTIVE.audio.output) && !codecWrite(0x32, 0xBF)) {
+    powerDown();
+    return false;
+  }
+  playbackState_.store(PlaybackState::PcmStream, std::memory_order_release);
+  streamLastSample_ = 0;
+  int16_t silence[STREAM_CHUNK_FRAMES * 2] = {};
+  if (!writeStreamSlots(silence, sizeof(silence), millis(), STREAM_WRITE_BUDGET_MS) || !codecMute(false)) {
+    failPcmStream();
+    endPcmStream();
+    return false;
+  }
+  setAmp(true);
+  if (BoardConfig::ACTIVE.audio.ampSettleMs > 0) {
+    vTaskDelay(pdMS_TO_TICKS(BoardConfig::ACTIVE.audio.ampSettleMs));
+  }
+  return true;
+}
+
+bool AudioManager::writeStreamSlots(const int16_t* slots, size_t bytes, uint32_t started, uint32_t budgetMs) {
+  size_t offset = 0;
+  while (offset < bytes) {
+    const uint32_t elapsed = static_cast<uint32_t>(millis()) - started;
+    if (elapsed >= budgetMs) return false;
+    const uint32_t remaining = budgetMs - elapsed;
+    const uint32_t timeout = remaining < STREAM_WRITE_SLICE_MS ? remaining : STREAM_WRITE_SLICE_MS;
+    size_t written = 0;
+    const esp_err_t result =
+        i2s_channel_write((i2s_chan_handle_t)txChan_, reinterpret_cast<const uint8_t*>(slots) + offset, bytes - offset,
+                          &written, timeout);  // IDF takes milliseconds, not ticks.
+    if (written > bytes - offset || written % (2 * sizeof(int16_t)) != 0 || written == 0) return false;
+    offset += written;
+    if (result != ESP_OK && result != ESP_ERR_TIMEOUT) return false;
+  }
+  return true;
+}
+
+void AudioManager::failPcmStream() {
+  setAmp(false);
+  playbackState_.store(PlaybackState::PcmStreamFailed, std::memory_order_release);
+}
+
+bool AudioManager::writePcmStream(const int16_t* samples, size_t count, uint8_t volume) {
+  if (playbackState_.load(std::memory_order_acquire) != PlaybackState::PcmStream) return false;
+  if (!samples || count == 0 || count > 1024) {
+    failPcmStream();
+    return false;
+  }
+  if (volume > 100) volume = 100;
+  const uint32_t started = millis();
+  int16_t slots[STREAM_CHUNK_FRAMES * 2];
+  size_t offset = 0;
+  while (offset < count) {
+    const size_t frames = count - offset < STREAM_CHUNK_FRAMES ? count - offset : STREAM_CHUNK_FRAMES;
+    for (size_t i = 0; i < frames; ++i) {
+      const int16_t sample = static_cast<int16_t>(static_cast<int32_t>(samples[offset + i]) * volume / 100);
+      slots[2 * i] = sample;
+      slots[2 * i + 1] = sample;
+    }
+    if (!writeStreamSlots(slots, frames * 2 * sizeof(int16_t), started, STREAM_WRITE_BUDGET_MS)) {
+      failPcmStream();
+      return false;
+    }
+    streamLastSample_ = slots[(frames - 1) * 2];
+    offset += frames;
+  }
+  return true;
+}
+
+void AudioManager::endPcmStream() {
+  const PlaybackState state = playbackState_.load(std::memory_order_acquire);
+  if (state != PlaybackState::PcmStream && state != PlaybackState::PcmStreamFailed) return;
+  if (state == PlaybackState::PcmStream) {
+    const uint32_t started = millis();
+    int16_t slots[STREAM_CHUNK_FRAMES * 2];
+    // Append a short release ramp, preserving every submitted source sample.
+    for (size_t i = 0; i < STREAM_CHUNK_FRAMES; ++i) {
+      const int16_t sample = static_cast<int16_t>(static_cast<int32_t>(streamLastSample_) *
+                                                  static_cast<int32_t>(STREAM_CHUNK_FRAMES - 1 - i) /
+                                                  static_cast<int32_t>(STREAM_CHUNK_FRAMES));
+      slots[2 * i] = slots[2 * i + 1] = sample;
+    }
+    if (writeStreamSlots(slots, sizeof(slots), started, STREAM_DRAIN_BUDGET_MS)) {
+      memset(slots, 0, sizeof(slots));
+      // More silence than the complete DMA ring guarantees queued content and
+      // the ramp reached the line before disabling it (normally under 24 ms).
+      for (size_t frames = 0; frames < STREAM_DMA_DESCRIPTORS * STREAM_DMA_FRAMES; frames += STREAM_CHUNK_FRAMES) {
+        if (!writeStreamSlots(slots, sizeof(slots), started, STREAM_DRAIN_BUDGET_MS)) break;
+      }
+    }
+  }
+  setAmp(false);
+  codecMute(true);
+  shutdownCodec();
+  teardownI2s();
+  streamLastSample_ = 0;
+  playbackState_.store(PlaybackState::Idle, std::memory_order_release);
+}
+
 bool AudioManager::startPlayback(const WavSource& source, const WavInfo& info, bool loop) {
   // Unmute the DAC (stop() mutes it). Codec writes stay on the caller's core
   // so the shared I2C bus is never touched from the audio task. The speaker
@@ -377,6 +528,9 @@ bool AudioManager::startPlayback(const WavSource& source, const WavInfo& info, b
   // loop owns core 1); 8K stack covers the on-stack sample buffers.
   if (xTaskCreatePinnedToCore(taskEntry, "audio_play", 8192, this, 10, &task_, 0) != pdPASS) {
     task_ = nullptr;
+    setAmp(false);
+    codecMute(true);
+    teardownI2s();
     playbackState_.store(PlaybackState::Idle, std::memory_order_release);
     return false;
   }
@@ -418,6 +572,10 @@ bool AudioManager::requestRestart() {
 void AudioManager::stop() {
   if (!begun_) return;
   PlaybackState state = playbackState_.load(std::memory_order_acquire);
+  if (state == PlaybackState::PcmStream || state == PlaybackState::PcmStreamFailed) {
+    endPcmStream();
+    return;
+  }
   while (state == PlaybackState::Playing || state == PlaybackState::RestartPending) {
     if (playbackState_.compare_exchange_weak(state, PlaybackState::Stopping, std::memory_order_acq_rel,
                                              std::memory_order_acquire)) {
@@ -573,17 +731,24 @@ bool AudioManager::begin() { return false; }
 void AudioManager::setVolume(uint8_t) {}
 bool AudioManager::play(const WavSource&, bool) { return false; }
 bool AudioManager::playPcm(const PcmSource&, uint32_t, uint8_t) { return false; }
+bool AudioManager::beginPcmStream(uint32_t) { return false; }
+bool AudioManager::writePcmStream(const int16_t*, size_t, uint8_t) { return false; }
+void AudioManager::endPcmStream() {}
 bool AudioManager::playBuffer(const uint8_t*, size_t, bool) { return false; }
 bool AudioManager::requestRestart() { return false; }
 void AudioManager::stop() {}
 void AudioManager::powerDown() {}
 bool AudioManager::parseWavHeader(const WavSource&, WavInfo&) { return false; }
 bool AudioManager::startPlayback(const WavSource&, const WavInfo&, bool) { return false; }
-bool AudioManager::ensureI2s(uint32_t) { return false; }
+bool AudioManager::ensureI2s(uint32_t, bool) { return false; }
+bool AudioManager::configureCodecRate(uint32_t) { return false; }
+bool AudioManager::writeStreamSlots(const int16_t*, size_t, uint32_t, uint32_t) { return false; }
+void AudioManager::failPcmStream() {}
+void AudioManager::shutdownCodec() {}
 void AudioManager::teardownI2s() {}
 bool AudioManager::codecInit() { return false; }
 bool AudioManager::codecWrite(uint8_t, uint8_t) { return false; }
-void AudioManager::codecMute(bool) {}
+bool AudioManager::codecMute(bool) { return false; }
 void AudioManager::setAmp(bool) {}
 void AudioManager::rollbackBegin() {}
 void AudioManager::taskEntry(void*) {}

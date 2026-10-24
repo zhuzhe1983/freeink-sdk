@@ -533,6 +533,8 @@ enum class TouchController : uint8_t { None, Chsc6x, Gt911, Ft5x06, Gslx680, Ft6
 // recovered from the OEM firmware dump; see the consumer's audio notes.
 // M5 PaperColor ships an ES8311 mono codec + AW8737A speaker amp — the
 // contract comes from the official pin map and M5Unified's speaker bring-up.
+// I2sEs8311Mclk16k retains its original name/value for source compatibility;
+// the external 256-fs clock profile now accepts both 16 and 24 kHz PCM.
 enum class AudioOutput : uint8_t { None, I2sDac, I2sEs8388, I2sEs8311, I2sEs8311Mclk16k, PwmBuzzer, MetalioModule };
 
 // Optional addressable RGB LED strip. PaperColor has two RGB LEDs on GPIO21

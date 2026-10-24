@@ -26,7 +26,7 @@
 namespace freeink {
 
 class AudioManager {
-  enum class PlaybackState : uint8_t { Idle, Playing, Stopping, RestartPending };
+  enum class PlaybackState : uint8_t { Idle, Playing, Stopping, RestartPending, PcmStream, PcmStreamFailed };
 
  public:
   struct WavSource {
@@ -62,6 +62,22 @@ class AudioManager {
   // slots. Only 16-bit little-endian, 1-2 channels, and 8-48 kHz are accepted.
   bool playPcm(const PcmSource& source, uint32_t sampleRate, uint8_t channels);
 
+  // Synchronous 24 kHz signed-16-bit mono output for an existing caller worker.
+  // No task/queue/source buffer is created. Refuses active async playback;
+  // callers must stop it and verify !isPlaying() before acquiring this stream.
+  // One owner serializes ALL methods on this instance (including setVolume,
+  // stop and powerDown). The same worker owns begin/write/end; other callers
+  // must not preempt it. Shared codec I2C bus access also requires caller locking.
+  bool beginPcmStream(uint32_t sampleRate = 24000);
+  // 1..1024 samples, linear volume (0=mute, 100=unity), <=100 ms I2S wait
+  // budget with individual waits <=20 ms. No I2C or heap operations here.
+  // False is terminal for this stream: an accepted prefix is never replayed.
+  // The amp is dropped immediately; the owner MUST call endPcmStream().
+  bool writePcmStream(const int16_t* samples, size_t count, uint8_t volume = 100);
+  // <=40 ms fade/drain budget, then mute/power-down and I2S cleanup. Driver/I2C
+  // cleanup latency is separate from the DMA budget. Idempotent, owner-only.
+  void endPcmStream();
+
   // Convenience: play from a memory buffer (e.g. an embedded default sound).
   bool playBuffer(const uint8_t* data, size_t len, bool loop);
 
@@ -88,12 +104,16 @@ class AudioManager {
   void taskLoop();
   bool parseWavHeader(const WavSource& source, WavInfo& info);
   bool startPlayback(const WavSource& source, const WavInfo& info, bool loop);
-  bool ensureI2s(uint32_t sampleRate);
+  bool ensureI2s(uint32_t sampleRate, bool stream = false);
+  bool configureCodecRate(uint32_t sampleRate);
   void teardownI2s();
+  bool writeStreamSlots(const int16_t* slots, size_t bytes, uint32_t started, uint32_t budgetMs);
+  void failPcmStream();
+  void shutdownCodec();
 
   bool codecInit();
   bool codecWrite(uint8_t reg, uint8_t value);
-  void codecMute(bool mute);
+  bool codecMute(bool mute);
   void setAmp(bool on);
   void rollbackBegin();
 
@@ -108,6 +128,7 @@ class AudioManager {
   void* txChan_ = nullptr;  // i2s_chan_handle_t (kept void* to slim the header)
   volatile bool chanEnabled_ = false;
   uint32_t currentRate_ = 0;
+  int16_t streamLastSample_ = 0;
 };
 
 }  // namespace freeink
