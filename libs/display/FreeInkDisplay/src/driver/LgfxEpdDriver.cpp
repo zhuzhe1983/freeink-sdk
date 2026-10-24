@@ -156,6 +156,8 @@ lgfx::LGFX_Sprite *g_canvas = nullptr;
 uint8_t *g_lsb = nullptr;
 uint8_t *g_msb = nullptr;
 uint16_t g_w = 0, g_h = 0, g_wb = 0;
+enum class CanvasState { Invalid, Ready, NativeLoan };
+CanvasState g_canvasState = CanvasState::Invalid;
 
 constexpr uint8_t kGrayBlack = 0x00, kGrayDark = 0x55, kGrayLight = 0xAA,
                   kGrayWhite = 0xFF;
@@ -206,7 +208,7 @@ void allocCanvas(uint16_t w, uint16_t h) {
 
 // Expand a 1-bpp B/W frame (bit set = white) into the 8-bit gray canvas.
 void fillCanvasBW(const uint8_t *fb) {
-  if (!g_canvas)
+  if (!g_canvas || !fb || g_canvasState == CanvasState::NativeLoan)
     return;
   auto *dst = static_cast<uint8_t *>(g_canvas->getBuffer());
   if (!dst)
@@ -220,6 +222,7 @@ void fillCanvasBW(const uint8_t *fb) {
         drow[bx * 8 + bit] = (b & (0x80 >> bit)) ? kGrayWhite : kGrayBlack;
     }
   }
+  g_canvasState = CanvasState::Ready;
 }
 
 // Overlay the buffered LSB/MSB planes onto the B/W canvas the base push left
@@ -276,7 +279,7 @@ bool lastPushUsedCleanBank() {
 }
 
 void pushCanvas(lgfx::epd_mode::epd_mode_t epdMode) {
-  if (!g_canvas)
+  if (!g_canvas || g_canvasState != CanvasState::Ready)
     return;
   g_dev.waitDisplay();
   g_dev.setEpdMode(epdMode);
@@ -363,6 +366,7 @@ void LgfxEpdDriver::display(EpdBus &bus, const uint8_t *fb, const uint8_t *prev,
   (void)bus;
   (void)prev;
 #if FREEINK_DRIVER_LGFX_EPD
+  cancelGrayscale16();
   fillCanvasBW(fb); // expand the 1-bpp frame into the gray canvas
   const auto epdMode = epdModeFor(mode);
   if (epdMode == lgfx::epd_mode::epd_text)
@@ -375,6 +379,51 @@ void LgfxEpdDriver::display(EpdBus &bus, const uint8_t *fb, const uint8_t *prev,
   (void)fb;
   (void)mode;
   (void)turnOff;
+#endif
+}
+
+uint8_t* LgfxEpdDriver::beginGrayscale16() {
+#if FREEINK_DRIVER_LGFX_EPD
+  if (BoardConfig::ACTIVE.grayscaleLevels != 16 || !g_canvas ||
+      g_canvasState == CanvasState::NativeLoan) return nullptr;
+  auto* data = static_cast<uint8_t*>(g_canvas->getBuffer());
+  if (!data) return nullptr;
+  g_dev.waitDisplay();
+  // Reuse the first half of the existing PSRAM canvas as packed 4bpp.
+  // No second full-screen allocation; the old host canvas is now invalid.
+  memset(data, 0xFF, static_cast<size_t>(g_w) * g_h / 2);
+  g_canvasState = CanvasState::NativeLoan;
+  return data;
+#else
+  return nullptr;
+#endif
+}
+
+bool LgfxEpdDriver::commitGrayscale16(const uint8_t* bwProxy) {
+  (void)bwProxy;
+#if FREEINK_DRIVER_LGFX_EPD
+  if (g_canvasState != CanvasState::NativeLoan || !g_canvas) return false;
+  auto* data = static_cast<uint8_t*>(g_canvas->getBuffer());
+  if (!data) { g_canvasState = CanvasState::Invalid; return false; }
+  // Expand backwards in place so no unread packed pixels are overwritten.
+  // PanelDriver's loan contract is even pixel LOW nibble, unlike icon assets.
+  for (size_t end = static_cast<size_t>(g_w) * g_h; end > 0; --end) {
+    const size_t pixel = end - 1;
+    data[pixel] = ((data[pixel / 2] >> ((pixel & 1) * 4)) & 15) * 17;
+  }
+  g_canvasState = CanvasState::Ready;
+  g_lastBaseEpdMode = lgfx::epd_mode::epd_quality;
+  pushCanvas(g_lastBaseEpdMode); // waits for the stock quality waveform to finish
+  g_dev.sleep();
+  return true;
+#else
+  return false;
+#endif
+}
+
+void LgfxEpdDriver::cancelGrayscale16() {
+#if FREEINK_DRIVER_LGFX_EPD
+  if (g_canvasState == CanvasState::NativeLoan) g_canvasState = CanvasState::Invalid;
 #endif
 }
 
@@ -423,6 +472,7 @@ void LgfxEpdDriver::displayGray(EpdBus &bus, const uint8_t *fb, bool turnOff,
   (void)lut;
   (void)factoryMode;
 #if FREEINK_DRIVER_LGFX_EPD
+  if (g_canvasState != CanvasState::Ready) return;
   (void)
       fb; // the canvas from the base push IS the base; see overlayCanvasGray()
   overlayCanvasGray(); // darken only the pixels the planes select
@@ -454,6 +504,7 @@ void LgfxEpdDriver::cleanupGrayscaleBuffers(EpdBus &bus, const uint8_t *bw) {
 void LgfxEpdDriver::deepSleep(EpdBus &bus) {
   (void)bus;
 #if FREEINK_DRIVER_LGFX_EPD
+  cancelGrayscale16();
   g_dev.sleep();
 #endif
 }

@@ -97,6 +97,34 @@ inline void setEpdPower(bool enabled) {
 
 inline void setEpdReset(bool high) { m5ioe1::write(m5ioe1::PIN_EPD_RESET, high); }
 
+// SX1262 on the dedicated SPI3 bus. Keep PM1/IOE1 ownership in this board
+// helper. IOE1 schematic IO numbers are one-based; PM1 GPIO numbers are zero-based.
+inline bool setRadioPower(bool enabled) {
+  if (!ensureBooted()) return false;
+  constexpr uint8_t pmPin = 1u << 2;
+  constexpr uint16_t reset = 1u << 9;    // IO10
+  constexpr uint16_t antenna = 1u << 1;  // IO2
+  if (!enabled) {
+    const bool resetOk = m5ioe1::write(reset | antenna, false);
+    return m5pm1::updateRegChecked(m5pm1::REG_GPIO_OUT, pmPin, 0) && resetOk;
+  }
+  const bool powerOk = m5pm1::updateRegChecked(m5pm1::REG_GPIO_FUNC0, 0x30, 0) &&
+                       m5pm1::updateRegChecked(m5pm1::REG_GPIO_PULL0, 0x30, 0) &&
+                       m5pm1::updateRegChecked(m5pm1::REG_GPIO_DRV, pmPin, 0) &&
+                       m5pm1::updateRegChecked(m5pm1::REG_GPIO_OUT, 0, pmPin) &&
+                       m5pm1::updateRegChecked(m5pm1::REG_GPIO_MODE, 0, pmPin);
+  const bool pinsOk = m5ioe1::updateReg16(m5ioe1::REG_GPIO_OUT_L, reset | antenna, 0) &&
+                      m5ioe1::updateReg16(m5ioe1::REG_GPIO_DRV_L, reset | antenna, 0) &&
+                      m5ioe1::updateReg16(m5ioe1::REG_GPIO_MODE_L, 0, reset | antenna);
+  if (!powerOk || !pinsOk) return false;
+  delay(200);
+  if (!m5ioe1::write(reset, true)) return false;
+  delay(200);
+  return true;
+}
+
+inline bool setRadioTransmit(bool transmit) { return m5ioe1::write(1u << 1, transmit); }
+
 // TF-card rail (IOE1 IO14 PYB_TF_EN -> TF_3V3_L3B LDO). configureOutputs()
 // boots it LOW, so the card is unpowered until SDCardManager raises it before
 // the SDMMC mount. 10 ms settle on power-up so the rail is stable before the

@@ -71,9 +71,80 @@ bool sentAuth(size_t i) { return FakeNet::requests()[i].find("Authorization:") !
 bool sentRange(size_t i, const char* range) {
   return FakeNet::requests()[i].find(std::string("Range: ") + range) != std::string::npos;
 }
+
+std::string responseWithFields(size_t count) {
+  assert(count > 0);
+  std::string response = "HTTP/1.1 200 OK\r\n";
+  for (size_t i = 1; i < count; ++i) response += "X-Repeated: value\r\n";
+  return response + "Content-Length: 1\r\n\r\nZ";
+}
+
+std::string responseWithHeaderBytes(size_t bytes, bool malformed = false) {
+  std::string response = "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n";
+  // Individually short fields make the aggregate bound, not MAX_LINE, decide
+  // whether this reply is accepted. Optionally use ignored colon-less lines.
+  const std::string name = malformed ? "xxx" : "X: ";
+  for (size_t i = 0; i < 4; ++i) response += name + std::string(3995, 'x') + "\r\n";
+  const size_t remaining = bytes - response.size() - 2;
+  assert(remaining >= 5 && remaining < 4096);
+  response += name + std::string(remaining - 5, 'x') + "\r\n\r\n";
+  assert(response.size() == bytes);
+  return response + "Z";
+}
+
+void headerLimitTests() {
+  for (size_t fields : {size_t{64}, size_t{65}}) {
+    const auto response = responseWithFields(fields);
+    reset({response.c_str()});
+    freeink::SecureHttpClient http;
+    assert(http.begin("http://a/headers"));
+    size_t delivered = 0;
+    const int status = http.GET([&](const uint8_t*, size_t size) {
+      delivered += size;
+      return true;
+    });
+    assert((fields == 64) ? status == 200 && delivered == 1 && http.responseComplete()
+                          : status == -1 && delivered == 0 && !http.responseComplete());
+    assert(http.getHeaders().size() == 64);
+    assert(FakeNet::requests().size() == 1);  // A limit rejection never retries itself.
+  }
+  for (bool malformed : {false, true}) {
+    for (size_t bytes : {size_t{16384}, size_t{16385}}) {
+      const auto response = responseWithHeaderBytes(bytes, malformed);
+      reset({response.c_str(), "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"});
+      freeink::SecureHttpClient http;
+      assert(http.begin("http://a/headers"));
+      size_t delivered = 0;
+      const int status = http.GET([&](const uint8_t*, size_t size) {
+        delivered += size;
+        return true;
+      });
+      assert((bytes == 16384) ? status == 200 && delivered == 1 && http.responseComplete()
+                              : status == -1 && delivered == 0 && !http.responseComplete());
+      // The next request must use a clean connection and fresh header budget.
+      assert(http.begin("http://a/recovery") && http.GET() == 200);
+      assert(http.responseComplete() && http.getString() == "ok" && FakeNet::hosts().size() == 2);
+      assert(http.getUniqueHeader("x") == nullptr);
+    }
+  }
+  for (const auto& response :
+       {std::string("HTTP/1.1 200 OK\r\nContent-Length: 1\r\nX: ") + std::string(4097, 'x') + "\r\n\r\nZ",
+        std::string("HTTP/1.1 200 OK\r\nContent-Length: 1\r\nX-Truncated: unfinished")}) {
+    reset({response.c_str()});
+    freeink::SecureHttpClient http;
+    assert(http.begin("http://a/headers"));
+    bool delivered = false;
+    assert(http.GET([&](const uint8_t*, size_t) {
+      delivered = true;
+      return true;
+    }) == -1);
+    assert(!delivered && !http.responseComplete());
+  }
+}
 }  // namespace
 
 int main() {
+  headerLimitTests();
   // Borrow a unique header during streaming, with no header collection copies.
   reset({"HTTP/1.1 200 OK\r\nContent-Disposition: attachment; filename=Book.epub\r\nContent-Length: 3\r\n\r\nabc"});
   {

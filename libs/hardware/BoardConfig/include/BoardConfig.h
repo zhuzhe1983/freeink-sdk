@@ -1438,7 +1438,12 @@ constexpr BoardProfile M5PAPER_S3 = {
     // via Rtc alarm), not an ESP32 GPIO. BMI270 IMU (0x68) unsupported — omitted.
     {41, 42, 400000, 0x51, 0, 0, 0, RtcType::Pcf8563, ImuType::None},
     1.2f,  // uiScale: 4.7" 960x540 touch (~234 PPI) — finger-sized chrome, like LilyGo/M5Paper
-    {}};   // no power latch: the PMS150G self-latches; off = GPIO44 pulse (BoardPaperS3::powerOff)
+    {},    // no power latch: off = GPIO44 pulse (BoardPaperS3::powerOff)
+    0,     // no controller variant
+    {},    // no bezel insets
+    false, // charging status active LOW
+    NO_I2C_FRONTLIGHT,
+    16};   // LGFX native quality waveform, packed 4bpp loan
 
 // --- Sticky (Seeed Sticky) — ESP32-S3R8, SSD1677 + GT911 touch ---------------
 // 3.97" 800x480 B/W e-paper on a 24-pin FPC, controller confirmed SSD1677 by the
@@ -2197,6 +2202,7 @@ constexpr BoardProfile READ_PICO = {
     16             // native GL16 image output
 };
 
+static_assert(M5PAPER_S3.grayscaleLevels == 16, "PaperS3 exposes native sixteen-level image output");
 static_assert(READ_PICO.grayscaleLevels == 16, "Read Pico exposes native sixteen-level image output");
 static_assert(XTEINK_X4.grayscaleLevels == 4 && XTEINK_X3.grayscaleLevels == 4,
               "Legacy profiles retain four-level output");

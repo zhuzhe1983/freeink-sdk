@@ -193,6 +193,10 @@ struct ListProps {
   int16_t rowPaddingY = -1;
   // Draw toggle rows as outlined boxes with an inset fill when checked.
   bool toggleCheckbox = false;
+  // Optional icon painter; the list still owns icon sizing, clipping and row
+  // hit geometry. Kept last to preserve existing aggregate initializers.
+  void (*iconPainter)(void *ctx, const Rect &rect, const ListItem &item, Paint foreground) = nullptr;
+  void *iconPainterCtx = nullptr;
 };
 
 // Stateful companion to the immediate-mode list helpers in FreeInkUICore.h:
@@ -817,8 +821,11 @@ void list(Frame<MaxInteractions> &frame, Rect rect, const ListProps &props) {
           iconX,
           static_cast<int16_t>(content.y + (content.height - iconSize) / 2),
           iconSize, iconSize};
-      frame.target().bitmap(iconRect, icon, BitmapMode::Contain,
-                            style.foreground);
+      if (props.iconPainter) {
+        props.iconPainter(props.iconPainterCtx, iconRect, item, style.foreground);
+      } else {
+        frame.target().bitmap(iconRect, icon, BitmapMode::Contain, style.foreground);
+      }
       if (!props.rtl)
         content.x = static_cast<int16_t>(content.x + iconSize + props.textGap);
       content.width =

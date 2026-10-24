@@ -232,11 +232,29 @@ class SecureHttpClient {
       // Connection: keep-alive header (below) overrides that.
       bool keepAlive = line.compare(0, 9, "HTTP/1.0 ") != 0;
 
+      // Bound retained header strings before substrings/vector growth. Count
+      // the status line, CRLFs and ignored malformed lines too; no large reserve
+      // is needed on memory-constrained boards.
+      size_t headerBytes = line.size() + 2;
       std::string transferEncoding;
-      while (readLine(*_conn, line, headerDeadline, shouldAbort)) {
+      for (;;) {
+        if (!readLine(*_conn, line, headerDeadline, shouldAbort)) {
+          closeConnection();
+          return -1;
+        }
+        const size_t lineBytes = line.size() + 2;
+        if (lineBytes > MAX_RESPONSE_HEADER_BYTES - headerBytes) {
+          closeConnection();
+          return -1;
+        }
+        headerBytes += lineBytes;
         if (line.empty()) break;  // end of headers
         const size_t colon = line.find(':');
         if (colon == std::string::npos) continue;
+        if (_responseHeaders.size() >= MAX_RESPONSE_HEADER_FIELDS) {
+          closeConnection();
+          return -1;
+        }
         std::string name = line.substr(0, colon);
         std::string value = line.substr(colon + 1);
         while (!value.empty() && value.front() == ' ') value.erase(value.begin());
@@ -591,7 +609,9 @@ class SecureHttpClient {
   // connection mid-stream; 2 KB removed the stall. Stack-allocated in the
   // body readers, so kept modest.
   static constexpr size_t READ_CHUNK = 2048;
-  static constexpr size_t MAX_LINE = 4096;  // header / chunk-size line cap
+  static constexpr size_t MAX_LINE = 4096;                        // header / chunk-size line cap
+  static constexpr size_t MAX_RESPONSE_HEADER_BYTES = 16 * 1024;  // status + fields + terminating CRLF
+  static constexpr size_t MAX_RESPONSE_HEADER_FIELDS = 64;        // duplicates count separately
 
   // Kept-alive connection state. _conn points at _secure or _plain while a
   // connection is held open, and null otherwise.

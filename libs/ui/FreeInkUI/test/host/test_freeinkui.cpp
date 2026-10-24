@@ -1977,6 +1977,41 @@ void testSelectedVisualOnlyDisabledListRow() {
 // RTL mirrors list()'s row layout: icon and label move to the trailing
 // (right) edge, value/toggle move to the leading (left) edge. Verifies both
 // halves of the swap against the same single-row fixture in one pass.
+void testListIconPainterUsesRowGeometry() {
+  static const uint8_t bits[32]{};
+  ListItem item{};
+  item.label = "Icon";
+  item.icon = {bits, 16, 16, BitmapFormat::Mask1, false};
+  item.actionValue = 7;
+  struct Capture { Rect rect{}; Color color = Color::Black; int calls = 0; } capture;
+  ListProps props;
+  props.items = &item;
+  props.count = 1;
+  props.action = 9;
+  props.rowHeight = 40;
+  props.sidePadding = 6;
+  props.iconPainterCtx = &capture;
+  props.iconPainter = [](void* ctx, const Rect& rect, const ListItem& row, Paint paint) {
+    auto& out = *static_cast<Capture*>(ctx);
+    out.rect = rect;
+    out.color = paint.color;
+    ++out.calls;
+    CHECK_EQ(row.actionValue, 7);
+  };
+  FakeDrawTarget target;
+  InteractionBuffer<4> interactions;
+  const auto device = makeDevice();
+  const InputSnapshot input{};
+  Frame<4> frame(target, device, input, interactions);
+  list(frame, Rect{10, 20, 100, 40}, props);
+  CHECK_EQ(capture.calls, 1);
+  CHECK_EQ(capture.rect.x, 16);
+  CHECK_EQ(capture.rect.y, 32);
+  CHECK_EQ(capture.rect.width, 16);
+  CHECK_EQ(interactions.count(), 1u);
+  for (size_t i = 0; i < target.opCount; ++i) CHECK(target.ops[i].kind != FakeDrawTarget::Op::Bitmap);
+}
+
 void testListRtlMirrorsIconAndValueSides() {
   static const uint8_t iconBits[4] = {0, 0, 0, 0};
   BitmapRef icon{iconBits, 16, 16, BitmapFormat::BW1, false};
@@ -6133,6 +6168,7 @@ void testPublicationPage() {
 }
 
 int main() {
+  testListIconPainterUsesRowGeometry();
   testScanKeepsPublishedHitTableAndRefreshStateUntilNormalRender();
   testScansPreserveHeldTouchAndTapFlashForExactlyTheNormalFrames();
   testUnselectedWrappedListKeepsScrollAndHitsWithoutFollowRebuilds();

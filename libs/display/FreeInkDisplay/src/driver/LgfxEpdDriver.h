@@ -38,7 +38,11 @@ class LgfxEpdDriver : public PanelDriver {
   void deepSleep(EpdBus& bus) override;
   void display(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, RefreshMode mode, bool turnOff) override;
 
-  // 16-gray path: the facade streams LSB/MSB 1-bpp planes (whole or in strips);
+  uint8_t* beginGrayscale16() override;
+  bool commitGrayscale16(const uint8_t* bwProxy) override;
+  void cancelGrayscale16() override;
+
+  // Four-level overlay: the facade streams LSB/MSB 1-bpp planes (whole or in strips);
   // displayGray combines them with the B/W base into the panel's 8-bit gray canvas.
   GrayscaleCapabilities grayscaleCapabilities(GrayscaleMode mode = GrayscaleMode::Overlay) const override {
     if (mode != GrayscaleMode::Overlay) return {};
