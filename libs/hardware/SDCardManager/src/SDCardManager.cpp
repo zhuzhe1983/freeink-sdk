@@ -11,6 +11,9 @@
 #include <new>
 
 #include "SdmmcBlockDevice.h"  // no-op unless FREEINK_SD_SDMMC
+#if FREEINK_SD_SDMMC
+#include "SdmmcVolume.h"
+#endif
 
 #if FREEINK_DEVICE_PAPERMONO
 #include <PaperMonoBoard.h>
@@ -68,7 +71,7 @@ bool SDCardManager::begin() {
     cachedUsedBytesValid = false;
     return false;
   }
-  if (!_vol.begin(_dev)) {
+  if (!freeink::mountSdmmcVolume(_vol, _dev)) {
     if (Serial) {
       // Which read failed: the MBR, or the first partition's boot sector.
       static uint8_t sec[512];
