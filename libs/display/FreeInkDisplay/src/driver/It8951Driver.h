@@ -27,16 +27,16 @@ namespace freeink {
 constexpr uint16_t IT8951_ROTATE_AUTO = 0xFF;
 
 struct It8951Config {
-  int8_t miso;        // SPI MISO (IT8951 register / device-info reads)
-  uint32_t spiHz;     // SPI clock
-  uint16_t rotation;  // LD_IMG rotation 0/1/2/3 = 0/90/180/270°, or IT8951_ROTATE_AUTO
-  uint16_t vcomMv;    // VCOM magnitude in mV (e.g. 2300 = -2.30 V); 0 = keep panel OTP
-  uint8_t fullMode;   // clearing refresh (GC16 = 2). Used for Full/Half, wake from
-                      // standby, and the periodic ghost-clear below.
-  uint8_t fastMode;   // B/W page turns (DU = 1, 2-level differential).
-  uint8_t grayMode;   // anti-aliased grayscale pages. DU4 (6) is a 4-level DIRECT
-                      // update: differential, so only changed pixels (the AA glyph
-                      // edges) move — no flash. GC16 (2) would drive every pixel.
+  int8_t miso;                  // SPI MISO (IT8951 register / device-info reads)
+  uint32_t spiHz;               // SPI clock
+  uint16_t rotation;            // LD_IMG rotation 0/1/2/3 = 0/90/180/270°, or IT8951_ROTATE_AUTO
+  uint16_t vcomMv;              // VCOM magnitude in mV (e.g. 2300 = -2.30 V); 0 = keep panel OTP
+  uint8_t fullMode;             // clearing refresh (GC16 = 2). Used for Full/Half, wake from
+                                // standby, and the periodic ghost-clear below.
+  uint8_t fastMode;             // B/W page turns (DU = 1, 2-level differential).
+  uint8_t grayMode;             // anti-aliased grayscale pages. DU4 (6) is a 4-level DIRECT
+                                // update: differential, so only changed pixels (the AA glyph
+                                // edges) move — no flash. GC16 (2) would drive every pixel.
   uint16_t ghostClearInterval;  // promote a differential (DU/DU4) refresh to a GC16
                                 // ghost-clear every N partials (0 = never). Keeps
                                 // DU/DU4 residue from accumulating across menu and
@@ -49,6 +49,7 @@ const It8951Config& it8951DefaultConfig();
 class It8951Driver : public PanelDriver {
  public:
   explicit It8951Driver(const It8951Config& cfg = it8951DefaultConfig());
+  ~It8951Driver() override;
 
   uint32_t spiHz() const override { return 0; }                                    // owns its own SPI
   BusyPolarity busyPolarity() const override { return BusyPolarity::ActiveHigh; }  // HRDY high = ready
@@ -58,6 +59,10 @@ class It8951Driver : public PanelDriver {
   void begin(EpdBus& bus) override;
   void deepSleep(EpdBus& bus) override;
   void display(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, RefreshMode mode, bool turnOff) override;
+  OpticalState opticalState() const override { return _opticalState; }
+  uint8_t* beginGrayscale16() override;
+  bool commitGrayscale16(const uint8_t* bwProxy) override;
+  void cancelGrayscale16() override;
 
   // --- grayscale (16-gray native; reconstruct base + LSB/MSB planes -> 4bpp) ---
   // Strip support is advertised so the consumer keeps the B/W frame intact and
@@ -76,12 +81,12 @@ class It8951Driver : public PanelDriver {
 
  private:
   // --- low-level SPI framing ---
-  void waitReady();                                    // block until HRDY high
-  void writeWord(uint16_t preamble, uint16_t value);   // one preamble+word CS-framed write
+  bool waitReady();                                   // bounded wait; failure aborts this operation
+  void writeWord(uint16_t preamble, uint16_t value);  // one preamble+word CS-framed write
   void writeCommand(uint16_t cmd);
   void writeData(uint16_t data);
   uint16_t readData();
-  void readWords(uint16_t* buf, uint16_t count);       // bulk read in one CS-low frame
+  void readWords(uint16_t* buf, uint16_t count);  // bulk read in one CS-low frame
   void writeReg(uint16_t reg, uint16_t value);
   uint16_t readReg(uint16_t reg);
 
@@ -90,10 +95,11 @@ class It8951Driver : public PanelDriver {
   void getDeviceInfo();
   void setTargetMemoryAddr(uint32_t addr);
   void setVcom(uint16_t mv);
-  void loadImageFull(const uint8_t* fb);  // expand 1bpp framebuffer -> 4bpp into controller SRAM
-  void loadImageGray(const uint8_t* base);  // combine base + LSB/MSB planes -> 4bpp into controller SRAM
+  void loadImageFull(const uint8_t* fb);        // expand 1bpp framebuffer -> 4bpp into controller SRAM
+  void loadImageGray(const uint8_t* base);      // combine base + LSB/MSB planes -> 4bpp into controller SRAM
+  void loadImageNative(const uint8_t* packed);  // even pixel LOW nibble -> IT8951 wire order
   void displayArea(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t mode);
-  void waitDisplayReady();                // poll LUT-busy register
+  bool waitDisplayReady();  // poll LUT-busy register; never fail open
 
   const It8951Config& _cfg;
   // Reference to the Arduino global SPI bus (VSPI on ESP32) — the SAME object the
@@ -113,6 +119,12 @@ class It8951Driver : public PanelDriver {
   uint32_t _imgBufAddr = 0;
   uint16_t _rotation = 0;
   bool _running = false;
+  bool _initialized = false;
+  bool _ioFailed = false;
+  OpticalState _opticalState = OpticalState::Unknown;
+  // Native 16-gray images need GC16 cleanup; four-level text overlays retain
+  // the existing DU/DU4 page cadence. Clear only after completed B/W GC16.
+  bool _nativeGrayCleanup = false;
 
   // Automatic ghost-clear: count differential (DU/DU4) refreshes and promote to a
   // GC16 clear every ghostClearInterval. _lastClear lets the gray pass match the
@@ -134,6 +146,9 @@ class It8951Driver : public PanelDriver {
   // scratch buffer, so by displayGray() the passed buffer is black — we use this
   // snapshot (captured before the clear) as the true base instead.
   uint8_t* _base = nullptr;
+  // 259,200 bytes on this panel, borrowed only for a native image render.
+  // Too large for internal RAM/stack; PSRAM-only and freed on commit/cancel.
+  uint8_t* _nativeGray = nullptr;
 };
 
 PanelDriver& it8951Driver();

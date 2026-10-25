@@ -11,6 +11,7 @@
 #include <cstring>
 
 #include "esp_heap_caps.h"
+#include "esp_log.h"
 #include "esp_system.h"
 
 namespace freeink {
@@ -58,16 +59,16 @@ inline uint8_t gray4(uint8_t base, uint8_t lsb, uint8_t msb, uint8_t mask) {
 
 const It8951Config& it8951DefaultConfig() {
   static const It8951Config cfg = {
-      13,                   // miso (M5Paper: GPIO13, shared with SD)
-      10000000,             // 10 MHz SPI
-      IT8951_ROTATE_AUTO,   // pick 0°/90° from the reported panel orientation
-      0,                    // vcomMv: 0 -> keep the panel's factory OTP VCOM
-      2,                    // fullMode  = GC16 (ghost-clearing; Full/Half/wake/periodic)
-      1,                    // fastMode  = DU   (2-level B/W, fast)
-      6,                    // grayMode  = DU4  (4-level DIRECT update: differential,
-                            //                   only changed pixels move -> no flash)
-      8,                    // ghostClearInterval: GC16 clear every 8 differential refreshes
-      0x001236E0,           // imgBufFallbackAddr (typical M5Paper IT8951 buffer base)
+      13,                  // miso (M5Paper: GPIO13, shared with SD)
+      10000000,            // 10 MHz SPI
+      IT8951_ROTATE_AUTO,  // pick 0°/90° from the reported panel orientation
+      0,                   // vcomMv: 0 -> keep the panel's factory OTP VCOM
+      2,                   // fullMode  = GC16 (ghost-clearing; Full/Half/wake/periodic)
+      1,                   // fastMode  = DU   (2-level B/W, fast)
+      6,                   // grayMode  = DU4  (4-level DIRECT update: differential,
+                           //                   only changed pixels move -> no flash)
+      8,                   // ghostClearInterval: GC16 clear every 8 differential refreshes
+      0x001236E0,          // imgBufFallbackAddr (typical M5Paper IT8951 buffer base)
   };
   return cfg;
 }
@@ -79,25 +80,37 @@ It8951Driver::It8951Driver(const It8951Config& cfg)
       _fbH(BoardConfig::ACTIVE.displayHeight),
       _fbWb(BoardConfig::ACTIVE.displayWidth / 8) {}
 
-PanelGeometry It8951Driver::geometry() const {
-  return {_fbW, _fbH, _fbWb, static_cast<uint32_t>(_fbWb) * _fbH};
+It8951Driver::~It8951Driver() {
+  cancelGrayscale16();
+  heap_caps_free(_gLsb);
+  heap_caps_free(_gMsb);
+  heap_caps_free(_base);
 }
 
-void It8951Driver::waitReady() {
-  if (_busy < 0) return;
+PanelGeometry It8951Driver::geometry() const { return {_fbW, _fbH, _fbWb, static_cast<uint32_t>(_fbWb) * _fbH}; }
+
+bool It8951Driver::waitReady() {
+  if (_ioFailed) return false;
+  if (_busy < 0) return true;
   const unsigned long start = millis();
   while (digitalRead(_busy) == LOW) {
-    if (millis() - start > READY_TIMEOUT_MS) {  // fail open rather than hang
+    if (millis() - start > READY_TIMEOUT_MS) {
 #ifdef IT8951_PROBE_DEBUG
       if (Serial) Serial.printf("[it8951] waitReady TIMEOUT (busy pin %d stuck LOW)\n", _busy);
 #endif
-      return;
+      _ioFailed = true;
+      _opticalState = OpticalState::Unknown;
+      _firstPaintPending = true;
+      ESP_LOGE("IT8951", "HRDY timeout; refresh aborted");
+      return false;
     }
+    delay(1);
   }
+  return true;
 }
 
 void It8951Driver::writeWord(uint16_t preamble, uint16_t value) {
-  waitReady();
+  if (!waitReady()) return;
   _spi.beginTransaction(SPISettings(_cfg.spiHz, MSBFIRST, SPI_MODE0));
   digitalWrite(_cs, LOW);
   _spi.transfer16(preamble);
@@ -110,7 +123,7 @@ void It8951Driver::writeCommand(uint16_t cmd) { writeWord(PRE_CMD, cmd); }
 void It8951Driver::writeData(uint16_t data) { writeWord(PRE_WR, data); }
 
 uint16_t It8951Driver::readData() {
-  waitReady();
+  if (!waitReady()) return 0xFFFF;
   _spi.beginTransaction(SPISettings(_cfg.spiHz, MSBFIRST, SPI_MODE0));
   digitalWrite(_cs, LOW);
   _spi.transfer16(PRE_RD);
@@ -122,7 +135,7 @@ uint16_t It8951Driver::readData() {
 }
 
 void It8951Driver::readWords(uint16_t* buf, uint16_t count) {
-  waitReady();
+  if (!waitReady()) return;
   _spi.beginTransaction(SPISettings(_cfg.spiHz, MSBFIRST, SPI_MODE0));
   digitalWrite(_cs, LOW);
   _spi.transfer16(PRE_RD);
@@ -148,7 +161,7 @@ void It8951Driver::systemRun() { writeCommand(CMD_SYS_RUN); }
 
 void It8951Driver::getDeviceInfo() {
   writeCommand(CMD_DEV_INFO);
-  uint16_t info[20];  // PanelW, PanelH, bufAddrL, bufAddrH, FW[8], LUT[8]
+  uint16_t info[20] = {};  // PanelW, PanelH, bufAddrL, bufAddrH, FW[8], LUT[8]
   readWords(info, 20);
   _panelW = info[0];
   _panelH = info[1];
@@ -191,16 +204,22 @@ void It8951Driver::displayArea(uint16_t x, uint16_t y, uint16_t w, uint16_t h, u
   writeData(mode);
 }
 
-void It8951Driver::waitDisplayReady() {
+bool It8951Driver::waitDisplayReady() {
   const unsigned long start = millis();
   while (readReg(REG_LUTAFSR) != 0) {
-    if (millis() - start > READY_TIMEOUT_MS) {
+    if (_ioFailed || millis() - start > READY_TIMEOUT_MS) {
 #ifdef IT8951_PROBE_DEBUG
       if (Serial) Serial.printf("[it8951] waitDisplayReady TIMEOUT (LUTAFSR never cleared)\n");
 #endif
-      return;
+      _ioFailed = true;
+      _opticalState = OpticalState::Unknown;
+      _firstPaintPending = true;
+      ESP_LOGE("IT8951", "LUT timeout; refresh aborted");
+      return false;
     }
+    delay(1);
   }
+  return !_ioFailed;
 }
 
 // Expand the 1bpp landscape framebuffer to the IT8951's 4bpp packing and stream it
@@ -228,7 +247,7 @@ void It8951Driver::loadImageFull(const uint8_t* fb) {
   const uint16_t maxXb = _fbWb <= sizeof(rowBuf) / 4 ? _fbWb : static_cast<uint16_t>(sizeof(rowBuf) / 4);
   const uint16_t rowOutBytes = static_cast<uint16_t>(maxXb * 4);  // 4bpp -> 2 px per byte
 
-  waitReady();
+  if (!waitReady()) return;
   _spi.beginTransaction(SPISettings(_cfg.spiHz, MSBFIRST, SPI_MODE0));
   digitalWrite(_cs, LOW);
   _spi.transfer16(PRE_WR);
@@ -274,7 +293,7 @@ void It8951Driver::loadImageGray(const uint8_t* base) {
   const uint16_t maxXb = _fbWb <= sizeof(rowBuf) / 4 ? _fbWb : static_cast<uint16_t>(sizeof(rowBuf) / 4);
   const uint16_t rowOutBytes = static_cast<uint16_t>(maxXb * 4);
 
-  waitReady();
+  if (!waitReady()) return;
   _spi.beginTransaction(SPISettings(_cfg.spiHz, MSBFIRST, SPI_MODE0));
   digitalWrite(_cs, LOW);
   _spi.transfer16(PRE_WR);
@@ -303,6 +322,10 @@ void It8951Driver::loadImageGray(const uint8_t* base) {
 
 void It8951Driver::begin(EpdBus& bus) {
   (void)bus;  // external bus: this driver owns SPI
+  cancelGrayscale16();
+  _ioFailed = false;
+  _initialized = false;
+  _opticalState = OpticalState::Unknown;
   const auto& d = BoardConfig::ACTIVE.display;
   _sclk = d.sclk;
   _mosi = d.mosi;
@@ -354,8 +377,9 @@ void It8951Driver::begin(EpdBus& bus) {
   if (!_gMsb) _gMsb = static_cast<uint8_t*>(heap_caps_malloc(planeBytes, MALLOC_CAP_SPIRAM));
   if (!_base) _base = static_cast<uint8_t*>(heap_caps_malloc(planeBytes, MALLOC_CAP_SPIRAM));
 
-  waitReady();
+  if (!waitReady()) return;
   getDeviceInfo();
+  if (_ioFailed) return;
   writeReg(REG_I80CPCR, 0x0001);  // enable host packed write
   setVcom(_cfg.vcomMv);
 
@@ -366,7 +390,7 @@ void It8951Driver::begin(EpdBus& bus) {
 
   // Clear to white with the INIT waveform (ignores buffer content).
   displayArea(0, 0, _panelW, _panelH, 0);
-  waitDisplayReady();
+  if (!waitDisplayReady()) return;
   if (esp_reset_reason() == ESP_RST_DEEPSLEEP) {
     // Waking with the sleep cover on the glass: INIT alone leaves faint
     // residue of dark art (most visible in dithered fields). Drive the pigment
@@ -377,17 +401,21 @@ void It8951Driver::begin(EpdBus& bus) {
       memset(_base, 0xFF, static_cast<size_t>(_fbWb) * _fbH);
       loadImageFull(_base);
       displayArea(0, 0, _panelW, _panelH, _cfg.fullMode);
-      waitDisplayReady();
+      if (!waitDisplayReady()) return;
     }
     displayArea(0, 0, _panelW, _panelH, 0);
-    waitDisplayReady();
+    if (!waitDisplayReady()) return;
   }
   _firstPaintPending = true;
+  _initialized = true;
 }
 
 void It8951Driver::display(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, RefreshMode mode, bool turnOff) {
   (void)bus;
   (void)prev;  // IT8951 holds the previous frame in its own SRAM
+  cancelGrayscale16();
+  _ioFailed = false;
+  if (!_initialized || !fb || !waitDisplayReady()) return;
 
   // A refresh clears ghosting when it's a Full/Half (the consumer's stronger
   // refresh), a wake from standby (fresh image), or the periodic ghost-clear —
@@ -395,6 +423,7 @@ void It8951Driver::display(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, 
   // activity navigation; promoting to GC16 every ghostClearInterval refreshes wipes
   // it automatically, like the X3 driver, with no firmware involvement.
   const bool clear = (mode != RefreshMode::Fast) || !_running || _firstPaintPending ||
+                     (_opticalState == OpticalState::Unknown) || _nativeGrayCleanup ||
                      (_cfg.ghostClearInterval != 0 && _partialsSinceClear >= _cfg.ghostClearInterval);
   const uint16_t dpyMode = clear ? _cfg.fullMode : _cfg.fastMode;
   _firstPaintPending = false;
@@ -411,10 +440,12 @@ void It8951Driver::display(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, 
 
   loadImageFull(fb);
   displayArea(0, 0, _panelW, _panelH, dpyMode);
-  waitDisplayReady();
+  if (!waitDisplayReady()) return;
 
   _partialsSinceClear = clear ? 0 : static_cast<uint16_t>(_partialsSinceClear + 1);
   _lastClear = clear;
+  _opticalState = OpticalState::Bw;
+  _nativeGrayCleanup = false;
 
   if (turnOff) {
     writeCommand(CMD_STANDBY);  // park the controller; next load re-runs SYS_RUN
@@ -424,9 +455,90 @@ void It8951Driver::display(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, 
 
 void It8951Driver::deepSleep(EpdBus& bus) {
   (void)bus;
-  waitDisplayReady();
+  cancelGrayscale16();
+  // A timed-out operation cannot be followed by sleep commands. Reboot or a
+  // new display request may retry after checking readiness.
+  if (!_initialized || _ioFailed) return;
+  if (!waitDisplayReady()) return;
   writeCommand(CMD_SLEEP);
   _running = false;
+}
+
+uint8_t* It8951Driver::beginGrayscale16() {
+  if (!_initialized || _nativeGray || !_fbW || _fbW > 960 || (_fbW % 8) != 0 || !_fbH) return nullptr;
+  _ioFailed = false;
+  if (!waitDisplayReady()) return nullptr;
+  // Full-frame drawing is the renderer's existing loan contract. The 253 KiB
+  // buffer cannot live on the stack or in internal RAM; release PSRAM as soon
+  // as this image is committed/cancelled instead of keeping a permanent cache.
+  const size_t bytes = static_cast<size_t>(_fbW) * _fbH / 2;
+  _nativeGray = static_cast<uint8_t*>(heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM));
+  if (!_nativeGray) {
+    ESP_LOGE("IT8951", "No PSRAM for native grayscale (%u bytes)", static_cast<unsigned>(bytes));
+    return nullptr;
+  }
+  memset(_nativeGray, 0xFF, bytes);
+  return _nativeGray;
+}
+
+void It8951Driver::loadImageNative(const uint8_t* packed) {
+  if (!_running) {
+    systemRun();
+    if (_ioFailed) return;
+    _running = true;
+  }
+  setTargetMemoryAddr(_imgBufAddr);
+  writeCommand(CMD_LD_IMG_AREA);
+  writeData(static_cast<uint16_t>((ENDIAN_BIG << 8) | (BPP_4 << 4) | (_rotation & 0x03)));
+  writeData(0);
+  writeData(0);
+  writeData(_fbW);
+  writeData(_fbH);
+  if (!waitReady()) return;
+  // Bounded 480-byte stack staging: SDK loans store the even pixel LOW, while
+  // IT8951's big-endian transfer puts it HIGH. Never mutate the caller's image.
+  uint8_t row[960 / 2];
+  const uint16_t rowBytes = _fbW / 2;
+  _spi.beginTransaction(SPISettings(_cfg.spiHz, MSBFIRST, SPI_MODE0));
+  digitalWrite(_cs, LOW);
+  _spi.transfer16(PRE_WR);
+  for (uint16_t y = 0; y < _fbH; ++y) {
+    const uint8_t* source = packed + static_cast<size_t>(y) * rowBytes;
+    for (uint16_t x = 0; x < rowBytes; ++x) row[x] = static_cast<uint8_t>((source[x] << 4) | (source[x] >> 4));
+    _spi.writeBytes(row, rowBytes);
+  }
+  digitalWrite(_cs, HIGH);
+  _spi.endTransaction();
+  writeCommand(CMD_LD_IMG_END);
+}
+
+bool It8951Driver::commitGrayscale16(const uint8_t* bwProxy) {
+  if (!_nativeGray) return false;
+  if (!_initialized || _ioFailed || !waitDisplayReady()) {
+    cancelGrayscale16();
+    return false;
+  }
+  _opticalState = OpticalState::Unknown;
+  _firstPaintPending = true;
+  _nativeGrayCleanup = true;
+  loadImageNative(_nativeGray);
+  displayArea(0, 0, _panelW, _panelH, _cfg.fullMode);  // GC16, never four-level DU4
+  const bool completed = waitDisplayReady();
+  cancelGrayscale16();
+  if (!completed) return false;
+  if (_base && bwProxy) memcpy(_base, bwProxy, static_cast<size_t>(_fbWb) * _fbH);
+  _opticalState = OpticalState::Gray;
+  _partialsSinceClear = 0;
+  _lastClear = true;
+  _firstPaintPending = false;
+  // Keep controller RAM available. Deep sleep is a separate explicit request;
+  // the next B/W display must clean real gray pixels with GC16 first.
+  return true;
+}
+
+void It8951Driver::cancelGrayscale16() {
+  heap_caps_free(_nativeGray);
+  _nativeGray = nullptr;
 }
 
 // --- grayscale -------------------------------------------------------------
@@ -453,10 +565,13 @@ void It8951Driver::writeGrayscalePlaneStrip(EpdBus& bus, GrayPlane plane, const 
   memcpy(dst + static_cast<uint32_t>(yStart) * _fbWb, rows, static_cast<size_t>(numRows) * _fbWb);
 }
 
-void It8951Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, const unsigned char* lut, bool factoryMode) {
+void It8951Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, const unsigned char* lut,
+                               bool factoryMode) {
   (void)bus;
   (void)lut;
   (void)factoryMode;
+  cancelGrayscale16();
+  if (_ioFailed || !waitDisplayReady()) return;
   // The consumer's strip-grayscale pass clears the live framebuffer (fb) to 0x00,
   // so use the B/W snapshot captured in display() as the base. Fall back to the
   // passed buffer only if no snapshot exists yet.
@@ -468,6 +583,7 @@ void It8951Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, con
                   base[mid], fb ? fb[0] : 0, _gLsb, _gMsb, turnOff);
   }
 #endif
+  if (!base) return;
   loadImageGray(base);  // base = snapshot B/W; LSB/MSB already buffered
   // DU4 is a differential update: only changed pixels (the AA glyph edges) move, so
   // a full-panel refresh refines the edges without a flash. On a page the B/W pass
@@ -475,7 +591,8 @@ void It8951Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, con
   const uint16_t gmode = (_lastClear || _firstPaintPending) ? _cfg.fullMode : _cfg.grayMode;
   _firstPaintPending = false;
   displayArea(0, 0, _panelW, _panelH, gmode);
-  waitDisplayReady();
+  if (!waitDisplayReady()) return;
+  _opticalState = OpticalState::Gray;
   if (turnOff) {
     writeCommand(CMD_STANDBY);
     _running = false;

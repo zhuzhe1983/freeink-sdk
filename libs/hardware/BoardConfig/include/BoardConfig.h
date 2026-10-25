@@ -357,7 +357,7 @@
   (FREEINK_DEVICE_X3 || FREEINK_DEVICE_STICKY || FREEINK_DEVICE_X4PRO || FREEINK_DEVICE_X4CLASSIC ||           \
    FREEINK_DEVICE_PAPERMONO || FREEINK_DEVICE_PAPERS3 || FREEINK_DEVICE_EEGO_A4 || FREEINK_DEVICE_MURPHY_M4 || \
    FREEINK_DEVICE_WAVESHARE_EPAPER_397 || FREEINK_DEVICE_LILYGO || FREEINK_DEVICE_METALIO_EINK4 ||             \
-   FREEINK_DEVICE_READPICO || FREEINK_DEVICE_WS397 || FREEINK_DEVICE_PICCO)
+   FREEINK_DEVICE_READPICO || FREEINK_DEVICE_WS397 || FREEINK_DEVICE_PICCO || FREEINK_DEVICE_M5PAPER)
 #endif
 #ifndef FREEINK_CAP_TEMP_HUMIDITY
 #define FREEINK_CAP_TEMP_HUMIDITY (FREEINK_DEVICE_STICKY)
@@ -1371,11 +1371,18 @@ constexpr BoardProfile M5PAPER_V11 = {
     NO_SDMMC,
     NO_GAUGE,
     NO_MIC,
-    NO_SENSORS,
+    {21, 22, 400000, 0x51, 0, 0, 0, RtcType::Pcf8563, ImuType::None},  // BM8563, shared with GT911
     1.2f,  // uiScale: 4.7" 960x540 touch (~234 PPI) — finger-sized chrome, like Sticky
     // Power latch: main-power MOSFET on GPIO2, driven HIGH first thing in boot
     // via holdPowerRails() or the board powers off when USB is unplugged.
-    {2}};
+    {2},
+    0,
+    {},
+    true,
+    NO_I2C_FRONTLIGHT,
+    16};  // IT8951 GC16 image path; text AA remains DU4
+
+static_assert(M5PAPER_V11.grayscaleLevels == 16, "M5Paper v1.1 exposes native sixteen-level images");
 
 // --- M5Stack PaperS3 4.7" (ED047TC1 raw-parallel EPD) — ESP32-S3 ---------------
 // The S3 successor to M5Paper v1.1: the same 960x540 16-gray ED047TC1 glass, but

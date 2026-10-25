@@ -3285,6 +3285,10 @@ void InputManager::beginGt911() {
   }
 
   touchDataEnabled = (gt911Addr != 0);
+#if FREEINK_DEVICE_PAPERS3
+  gt911LastPollAt = millis();
+  gt911SyncState = Gt911SyncState::Ready;
+#endif
 #ifdef TOUCH_PROBE_DEBUG
   touchDebugPrintf("[touch] GT911 probe: addr=0x%02X enabled=%d (sda=%d scl=%d "
                    "cand=0x%02X/0x%02X)\n",
@@ -3314,18 +3318,67 @@ bool InputManager::gt911ReadReg(const uint16_t reg, uint8_t *buf,
   return true;
 }
 
-void InputManager::gt911ClearStatus() {
+bool InputManager::gt911ClearStatus() {
   Wire.beginTransmission(gt911Addr);
   Wire.write(0x81);
   Wire.write(0x4E);
   Wire.write(static_cast<uint8_t>(0x00));
-  Wire.endTransmission();
+  return Wire.endTransmission() == 0;
 }
+
+#if FREEINK_DEVICE_PAPERS3
+bool InputManager::resyncGt911AfterPollGap(const uint32_t now) {
+  const uint32_t elapsed = now - gt911LastPollAt;
+  gt911LastPollAt = now;
+  if (elapsed >= GT911_STALE_POLL_MS) {
+    // GT911 retains a frame until 0x814E is acknowledged. M5GFX's GT911
+    // driver discards it after a >=128 ms polling gap. Do the same without
+    // its blocking retry loop: the next normal poll reads the fresh frame.
+    const bool contactUnfinished =
+        touchPressed || touchHomeKeyDown || gt911SyncState == Gt911SyncState::AwaitingRelease;
+    gt911SyncState = contactUnfinished ? Gt911SyncState::AwaitingRelease : Gt911SyncState::ClearPending;
+    suppressTouchContact();
+    touchPressed = false;
+    touchPressedEvent = false;
+    touchReleasedEvent = false;
+    touchPoint.valid = false;
+    touchSnapshot = {};
+    touchHomeKeyDown = false;
+    touchHomeKeyEvent = false;
+    touchHomeKeyTapEvent = false;
+    touchHomeKeyLongEvent = false;
+    touchLongPressEvent = false;
+  }
+
+  switch (gt911SyncState) {
+    case Gt911SyncState::Ready:
+      return false;
+    case Gt911SyncState::ClearPending:
+    case Gt911SyncState::AwaitingRelease:
+      break;
+  }
+
+  uint8_t status = 0;
+  if (!gt911ReadReg(0x814E, &status, 1)) return true;
+  if (gt911SyncState == Gt911SyncState::AwaitingRelease && !(status & 0x80)) return true;
+  if (!gt911ClearStatus()) return true;  // Retry the acknowledgement; never replay an unconfirmed frame.
+
+  // A finger spanning a stalled render must not become a new tap in the next
+  // page. Drain it through a confirmed idle frame. No synthetic tap, swipe or
+  // long-press is emitted by recovery. An already idle controller is ready
+  // immediately, so a normal first tap after an idle render is not swallowed.
+  gt911SyncState = (status & 0x1F) ? Gt911SyncState::AwaitingRelease : Gt911SyncState::Ready;
+  return true;
+}
+#endif
 
 void InputManager::pollGt911(const unsigned long now) {
   if (gt911Addr == 0) {
     return;
   }
+#if FREEINK_DEVICE_PAPERS3
+  if (resyncGt911AfterPollGap(static_cast<uint32_t>(now))) return;
+#endif
   uint8_t status = 0;
   if (!gt911ReadReg(0x814E, &status, 1)) {
     // Keep the last complete frame while the single-touch state remains

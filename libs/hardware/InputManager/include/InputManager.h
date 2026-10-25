@@ -431,8 +431,15 @@ private:
   volatile bool cstIrqPending = true;
 #endif
   void beginGt911();
-  bool gt911ReadReg(uint16_t reg, uint8_t *buf, uint8_t len);
-  void gt911ClearStatus();
+  bool gt911ReadReg(uint16_t reg, uint8_t* buf, uint8_t len);
+  bool gt911ClearStatus();
+#if FREEINK_DEVICE_PAPERS3
+  bool resyncGt911AfterPollGap(uint32_t now);
+  enum class Gt911SyncState : uint8_t { Ready, ClearPending, AwaitingRelease };
+  Gt911SyncState gt911SyncState = Gt911SyncState::Ready;
+  uint32_t gt911LastPollAt = 0;
+  static constexpr uint32_t GT911_STALE_POLL_MS = 128;
+#endif
   enum class MultiTouchGestureState : uint8_t { Idle, Tracking, Blocked };
   struct TrackedTouchContact {
     uint8_t id;

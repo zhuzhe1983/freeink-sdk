@@ -60,6 +60,24 @@ touch paging). Firmware without touch page-turn support is unusable here.
 - GPIO48 is **not an RTC IO** on the S3: touch cannot be a deep-sleep EXT wake
   source (M5Unified uses light-sleep GPIO wake instead).
 
+### Polling after a stalled render
+
+GT911 keeps a sample until register `0x814E` is cleared. PaperS3 discards an
+unacknowledged sample after a polling gap of at least 128 ms, following the
+threshold in M5GFX 0.2.20's `Touch_GT911::getTouchRaw`. Recovery is nonblocking:
+I2C failures retry on the next input poll; an unfinished finger is drained
+through a confirmed release without creating a tap, swipe or long press on a
+different page. An idle controller immediately accepts the next new contact.
+The two recovery fields occupy eight bytes in the existing PaperS3 input
+object (including alignment), with no heap allocation or polling task.
+Other board targets retain their existing GT911 behavior.
+
+`libs/hardware/InputManager/test/host/test_gt911_poll_gap.py` exercises the
+production methods with delayed frames, held contacts, I2C failures and clock
+rollover. Physical acceptance still requires checking Home/Settings taps and
+reader gestures during and after refresh; passing host tests alone does not
+establish the cause of a particular device's erratic touch.
+
 ## Power
 
 - **No power latch for firmware to hold** — the PMS150G self-latches; the
