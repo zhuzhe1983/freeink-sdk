@@ -14,9 +14,12 @@ STUBS = {
 #include <cstddef>
 #include <vector>
 #include <cstdlib>
+#include <cassert>
 namespace fake {
 inline unsigned long now=0;
 inline bool ready=true, failAlloc=false, failRefresh=false, lutBusy=false, failAfterPixels=false;
+inline bool selected=false, awake=false, failAfterPreamble=false, failAfterReadDummy=false;
+inline unsigned long readyAt=0;
 inline unsigned command=0, reg=0;
 inline std::vector<std::vector<uint8_t>> txs;
 inline size_t allocations=0;
@@ -24,8 +27,8 @@ inline size_t allocations=0;
 constexpr int HIGH=1, LOW=0, OUTPUT=1, INPUT=0;
 inline unsigned long millis(){return fake::now;}
 inline void delay(unsigned long n){fake::now+=n;}
-inline int digitalRead(int){return fake::ready?HIGH:LOW;}
-inline void digitalWrite(int,int){}
+inline int digitalRead(int){return fake::ready && fake::now>=fake::readyAt ? HIGH:LOW;}
+inline void digitalWrite(int pin,int value){if(pin==15)fake::selected=value==LOW;}
 inline void pinMode(int,int){}
 ''',
 'SPI.h': r'''#pragma once
@@ -37,20 +40,25 @@ struct SPIClass {
  void begin(int,int,int,int){}
  void beginTransaction(SPISettings){tx.clear();}
  uint16_t transfer16(uint16_t value){
+  assert(fake::selected && fake::ready && fake::now>=fake::readyAt);
   tx.push_back(value>>8);tx.push_back(value&255);
+  if(tx.size()==2){fake::readyAt=fake::now+3;if(fake::failAfterPreamble)fake::ready=false;}
+  if(tx.size()==4 && tx[0]==0x10){fake::readyAt=fake::now+2;if(fake::failAfterReadDummy)fake::ready=false;}
   if(tx.size()<=4 || tx[0]!=0x10) return 0;
   if(fake::command==0x302){
+   assert(fake::awake);
    constexpr uint16_t info[20]={540,960,0x36e0,0x12};
    return info[(tx.size()-6)/2];
   }
   return fake::reg==0x1224 && fake::lutBusy ? 1:0;
  }
- void writeBytes(uint8_t* bytes,size_t n){tx.insert(tx.end(),bytes,bytes+n);}
+ void writeBytes(uint8_t* bytes,size_t n){assert(fake::selected && fake::ready && fake::now>=fake::readyAt);tx.insert(tx.end(),bytes,bytes+n);}
  void endTransaction(){
+  assert(!fake::selected);
   fake::txs.push_back(tx);
   if(tx.size()==4){
    const unsigned value=(unsigned(tx[2])<<8)|tx[3];
-   if(tx[0]==0x60){fake::command=value;if(value==0x34&&fake::failRefresh)fake::lutBusy=true;}
+   if(tx[0]==0x60){fake::command=value;if(value==1)fake::awake=true;if(value==0x34&&fake::failRefresh)fake::lutBusy=true;}
    else if(tx[0]==0&&fake::command==0x10)fake::reg=value;
   }
   if(tx.size()>100 && tx[0]==0 && fake::failAfterPixels)fake::ready=false;
@@ -97,13 +105,14 @@ bool command(unsigned value){
  for(auto& tx:fake::txs)if(tx.size()==4&&tx[0]==0x60&&word(tx)==value)return true;
  return false;
 }
-void clear(){fake::txs.clear();fake::failRefresh=false;fake::failAfterPixels=false;fake::lutBusy=false;fake::ready=true;}
+void clear(){fake::txs.clear();fake::failRefresh=false;fake::failAfterPixels=false;fake::lutBusy=false;fake::ready=true;fake::readyAt=fake::now;fake::failAfterPreamble=false;fake::failAfterReadDummy=false;}
 int main(){
  EpdBus bus;
  {
   It8951Driver driver;
   assert(!driver.beginGrayscale16());
   driver.begin(bus);
+  assert(command(1) && fake::awake && !fake::selected);
   const size_t resident=fake::allocations;
   assert(resident==3);
   std::vector<uint8_t> bw(64800,0xff),lsb(64800,0),msb(64800,0);
@@ -155,6 +164,13 @@ int main(){
   assert(!command(0x21)&&!command(0x34)&&driver.opticalState()==OpticalState::Unknown);
   auto n=fake::txs.size();driver.deepSleep(bus);assert(n==fake::txs.size());
   assert(fake::allocations==resident);
+  // Busy after a preamble/dummy must close CS and stop before payload or pixels.
+  clear();assert(driver.beginGrayscale16());fake::failAfterPreamble=true;
+  assert(!driver.commitGrayscale16(bw.data()));
+  assert(!fake::selected&&!command(0x21)&&!command(0x34)&&fake::allocations==resident);
+  clear();assert(driver.beginGrayscale16());fake::failAfterReadDummy=true;
+  assert(!driver.commitGrayscale16(bw.data()));
+  assert(!fake::selected&&!command(0x21)&&!command(0x34)&&fake::allocations==resident);
   // Readiness failure after upload must prevent LD_IMG_END and DPY_AREA.
   clear();assert(driver.beginGrayscale16());fake::failAfterPixels=true;
   assert(!driver.commitGrayscale16(bw.data()));assert(!command(0x22)&&!command(0x34));

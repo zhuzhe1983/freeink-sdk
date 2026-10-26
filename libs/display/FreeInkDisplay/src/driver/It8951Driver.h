@@ -82,6 +82,8 @@ class It8951Driver : public PanelDriver {
  private:
   // --- low-level SPI framing ---
   bool waitReady();                                   // bounded wait; failure aborts this operation
+  bool beginTransfer(uint16_t preamble);  // hold CS through the preamble/payload readiness handshake
+  void endTransfer();
   void writeWord(uint16_t preamble, uint16_t value);  // one preamble+word CS-framed write
   void writeCommand(uint16_t cmd);
   void writeData(uint16_t data);

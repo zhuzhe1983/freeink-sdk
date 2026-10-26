@@ -109,40 +109,47 @@ bool It8951Driver::waitReady() {
   return true;
 }
 
-void It8951Driver::writeWord(uint16_t preamble, uint16_t value) {
-  if (!waitReady()) return;
+bool It8951Driver::beginTransfer(uint16_t preamble) {
+  if (!waitReady()) return false;
   _spi.beginTransaction(SPISettings(_cfg.spiHz, MSBFIRST, SPI_MODE0));
   digitalWrite(_cs, LOW);
   _spi.transfer16(preamble);
-  _spi.transfer16(value);
+  // IT8951 can lower HRDY after accepting a preamble. Keep CS asserted while
+  // waiting, but always release the shared bus if the controller times out.
+  if (waitReady()) return true;
+  endTransfer();
+  return false;
+}
+
+void It8951Driver::endTransfer() {
   digitalWrite(_cs, HIGH);
   _spi.endTransaction();
+}
+
+void It8951Driver::writeWord(uint16_t preamble, uint16_t value) {
+  if (!beginTransfer(preamble)) return;
+  _spi.transfer16(value);
+  endTransfer();
 }
 
 void It8951Driver::writeCommand(uint16_t cmd) { writeWord(PRE_CMD, cmd); }
 void It8951Driver::writeData(uint16_t data) { writeWord(PRE_WR, data); }
 
 uint16_t It8951Driver::readData() {
-  if (!waitReady()) return 0xFFFF;
-  _spi.beginTransaction(SPISettings(_cfg.spiHz, MSBFIRST, SPI_MODE0));
-  digitalWrite(_cs, LOW);
-  _spi.transfer16(PRE_RD);
+  if (!beginTransfer(PRE_RD)) return 0xFFFF;
   _spi.transfer16(0x0000);  // dummy word the controller requires before valid data
-  const uint16_t v = _spi.transfer16(0x0000);
-  digitalWrite(_cs, HIGH);
-  _spi.endTransaction();
+  const uint16_t v = waitReady() ? _spi.transfer16(0x0000) : 0xFFFF;
+  endTransfer();
   return v;
 }
 
 void It8951Driver::readWords(uint16_t* buf, uint16_t count) {
-  if (!waitReady()) return;
-  _spi.beginTransaction(SPISettings(_cfg.spiHz, MSBFIRST, SPI_MODE0));
-  digitalWrite(_cs, LOW);
-  _spi.transfer16(PRE_RD);
+  if (!beginTransfer(PRE_RD)) return;
   _spi.transfer16(0x0000);  // dummy
-  for (uint16_t i = 0; i < count; i++) buf[i] = _spi.transfer16(0x0000);
-  digitalWrite(_cs, HIGH);
-  _spi.endTransaction();
+  if (waitReady()) {
+    for (uint16_t i = 0; i < count; i++) buf[i] = _spi.transfer16(0x0000);
+  }
+  endTransfer();
 }
 
 void It8951Driver::writeReg(uint16_t reg, uint16_t value) {
@@ -247,10 +254,7 @@ void It8951Driver::loadImageFull(const uint8_t* fb) {
   const uint16_t maxXb = _fbWb <= sizeof(rowBuf) / 4 ? _fbWb : static_cast<uint16_t>(sizeof(rowBuf) / 4);
   const uint16_t rowOutBytes = static_cast<uint16_t>(maxXb * 4);  // 4bpp -> 2 px per byte
 
-  if (!waitReady()) return;
-  _spi.beginTransaction(SPISettings(_cfg.spiHz, MSBFIRST, SPI_MODE0));
-  digitalWrite(_cs, LOW);
-  _spi.transfer16(PRE_WR);
+  if (!beginTransfer(PRE_WR)) return;
   for (uint16_t y = 0; y < _fbH; y++) {
     const uint8_t* src = fb + static_cast<uint32_t>(y) * _fbWb;
     uint16_t o = 0;
@@ -263,8 +267,7 @@ void It8951Driver::loadImageFull(const uint8_t* fb) {
     }
     _spi.writeBytes(rowBuf, rowOutBytes);
   }
-  digitalWrite(_cs, HIGH);
-  _spi.endTransaction();
+  endTransfer();
 
   writeCommand(CMD_LD_IMG_END);
 }
@@ -293,10 +296,7 @@ void It8951Driver::loadImageGray(const uint8_t* base) {
   const uint16_t maxXb = _fbWb <= sizeof(rowBuf) / 4 ? _fbWb : static_cast<uint16_t>(sizeof(rowBuf) / 4);
   const uint16_t rowOutBytes = static_cast<uint16_t>(maxXb * 4);
 
-  if (!waitReady()) return;
-  _spi.beginTransaction(SPISettings(_cfg.spiHz, MSBFIRST, SPI_MODE0));
-  digitalWrite(_cs, LOW);
-  _spi.transfer16(PRE_WR);
+  if (!beginTransfer(PRE_WR)) return;
   for (uint16_t y = 0; y < _fbH; y++) {
     const uint32_t rowOff = static_cast<uint32_t>(y) * _fbWb;
     const uint8_t* brow = base + rowOff;
@@ -314,8 +314,7 @@ void It8951Driver::loadImageGray(const uint8_t* base) {
     }
     _spi.writeBytes(rowBuf, rowOutBytes);
   }
-  digitalWrite(_cs, HIGH);
-  _spi.endTransaction();
+  endTransfer();
 
   writeCommand(CMD_LD_IMG_END);
 }
@@ -325,6 +324,7 @@ void It8951Driver::begin(EpdBus& bus) {
   cancelGrayscale16();
   _ioFailed = false;
   _initialized = false;
+  _running = false;
   _opticalState = OpticalState::Unknown;
   const auto& d = BoardConfig::ACTIVE.display;
   _sclk = d.sclk;
@@ -378,6 +378,8 @@ void It8951Driver::begin(EpdBus& bus) {
   if (!_base) _base = static_cast<uint8_t*>(heap_caps_malloc(planeBytes, MALLOC_CAP_SPIRAM));
 
   if (!waitReady()) return;
+  systemRun();  // controller power-on/standby is distinct from the ESP32 reset
+  if (_ioFailed) return;
   getDeviceInfo();
   if (_ioFailed) return;
   writeReg(REG_I80CPCR, 0x0001);  // enable host packed write
@@ -494,21 +496,17 @@ void It8951Driver::loadImageNative(const uint8_t* packed) {
   writeData(0);
   writeData(_fbW);
   writeData(_fbH);
-  if (!waitReady()) return;
+  if (!beginTransfer(PRE_WR)) return;
   // Bounded 480-byte stack staging: SDK loans store the even pixel LOW, while
   // IT8951's big-endian transfer puts it HIGH. Never mutate the caller's image.
   uint8_t row[960 / 2];
   const uint16_t rowBytes = _fbW / 2;
-  _spi.beginTransaction(SPISettings(_cfg.spiHz, MSBFIRST, SPI_MODE0));
-  digitalWrite(_cs, LOW);
-  _spi.transfer16(PRE_WR);
   for (uint16_t y = 0; y < _fbH; ++y) {
     const uint8_t* source = packed + static_cast<size_t>(y) * rowBytes;
     for (uint16_t x = 0; x < rowBytes; ++x) row[x] = static_cast<uint8_t>((source[x] << 4) | (source[x] >> 4));
     _spi.writeBytes(row, rowBytes);
   }
-  digitalWrite(_cs, HIGH);
-  _spi.endTransaction();
+  endTransfer();
   writeCommand(CMD_LD_IMG_END);
 }
 
